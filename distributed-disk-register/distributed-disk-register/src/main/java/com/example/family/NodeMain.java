@@ -27,26 +27,24 @@ import java.util.concurrent.*;
 
 public class NodeMain {
 
+
     private static final int START_PORT = 5555;
     private static final int PRINT_INTERVAL_SECONDS = 10;
     private static final java.util.concurrent.atomic.AtomicInteger requestCounter = new java.util.concurrent.atomic.AtomicInteger(0);
-    private static int TOLERANCE = 1; 
+    private static int TOLERANCE = 1;
     private static final Map<Integer, List<NodeInfo>> messageLocations = new ConcurrentHashMap<>();
-
-    private static IStorageService storageService; 
-
-
+    private static IStorageService storageService; //new BufferedStorageService();
     public static void main(String[] args) throws Exception {
         String host = "127.0.0.1";
         int port = findFreePort(START_PORT);
 
-        storageService = new BufferedStorageService(port);
-        //storageService = new UnbufferedStorageService(port);
+       storageService = new BufferedStorageService(port);
 
         NodeInfo self = NodeInfo.newBuilder()
                 .setHost(host)
                 .setPort(port)
                 .build();
+
         TOLERANCE = loadTolerance();
         System.out.println("⚙️ Sistem Toleransı: " + TOLERANCE);
 
@@ -61,7 +59,6 @@ public class NodeMain {
 
         System.out.printf("Node started on %s:%d%n", host, port);
 
-        // Eğer bu ilk node ise (port 5555), TCP 6666'da text dinlesin
         if (port == START_PORT) {
             startLeaderTextListener(registry, self);
         }
@@ -74,7 +71,6 @@ public class NodeMain {
     }
 
     private static void startLeaderTextListener(NodeRegistry registry, NodeInfo self) {
-        // Sadece lider (5555 portlu node) bu methodu çağırmalı
         new Thread(() -> {
             try (ServerSocket serverSocket = new ServerSocket(6666)) {
                 System.out.printf("Leader listening for text on TCP %s:%d%n",
@@ -97,7 +93,6 @@ public class NodeMain {
         try (BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream()));
              PrintWriter output = new PrintWriter(client.getOutputStream(), true)) {
 
-            // 1.AŞAMA: SET ve GET komutlarını parse et.
             String line;
             while ((line = reader.readLine()) != null) {
                 String text = line.trim();
@@ -106,83 +101,66 @@ public class NodeMain {
                 String[] parts = text.split(" ", 3);
                 String commandType = parts[0].toUpperCase();
 
+                // --- SET KOMUTU ---
                 if (commandType.equals("SET")) {
-                    if (parts.length < 3) {
-                        output.println("NOT_FOUND (Eksik parametre)");
-                    } else {
-                        try {
-                            int id = Integer.parseInt(parts[1]);
-                            String msg = parts[2];
+                    try {
+                        int id = Integer.parseInt(parts[1]);
+                        String msg = parts[2];
 
-                            // kendi diskine yaz
-                            storageService.put(id, msg);
+                        List<NodeInfo> successfulNodes = new ArrayList<>();
 
-                            List<NodeInfo> successfulNodes = new ArrayList<>();
-                            successfulNodes.add(self); // lideri listeye ekle
+                        List<NodeInfo> candidates = registry.snapshot().stream()
+                                .filter(n -> n.getPort() != self.getPort())
+                                .sorted(java.util.Comparator.comparingInt(NodeInfo::getPort))
+                                .collect(java.util.stream.Collectors.toList());
 
-                            List<NodeInfo> candidates = registry.snapshot().stream()
-                                    .filter(n -> n.getPort() != self.getPort()) 
-                                    .sorted(java.util.Comparator.comparingInt(NodeInfo::getPort))
-                                    .collect(java.util.stream.Collectors.toList());
+                        if (!candidates.isEmpty()) {
+                            int currentIndex = requestCounter.getAndIncrement() % candidates.size();
+                            int sentCount = 0;
 
-                            if (!candidates.isEmpty()) {
-                                // Round-Robin başlangıç noktası belirle
-                                int currentIndex = requestCounter.getAndIncrement() % candidates.size();
+                            for (int i = 0; i < candidates.size(); i++) {
+                                if (sentCount >= TOLERANCE) break;
 
-                                int sentCount = 0;
-                                for (int i = 0; i < candidates.size(); i++) {
-                                    if (sentCount >= TOLERANCE) break; 
+                                NodeInfo target = candidates.get((currentIndex + i) % candidates.size());
 
-                                    NodeInfo target = candidates.get((currentIndex + i) % candidates.size());
-
-                                    if (callStoreRpcSync(target, id, msg)) {
-                                        successfulNodes.add(target);
-                                        sentCount++;
-                                        System.out.println("➡️ [LoadBalance] Veri " + target.getPort() + " portuna gönderildi.");
-                                    } else {
-                                        System.err.println("❌ Hata: " + target.getPort() + " portuna ulaşılamadı.");
-                                    }
+                                if (callStoreRpcSync(target, id, msg)) {
+                                    successfulNodes.add(target);
+                                    sentCount++;
                                 }
                             }
+                        }
 
-                            // haritayı güncelle ve cevap dön
+                        if (successfulNodes.isEmpty()) {
+                            output.println("NOT_FOUND (Yazilacak uygun dugum bulunamadi)");
+                        } else {
                             messageLocations.put(id, successfulNodes);
                             output.println("OK");
-                            System.out.println("💾 ID " + id + " kaydedildi. Toplam kopya: " + successfulNodes.size());
-
-                        } catch (NumberFormatException e) {
-                            output.println("NOT_FOUND (ID sayi olmali)");
-                        } catch (Exception e) {
-                            output.println("NOT_FOUND (Sistemsel Hata)");
-                            e.printStackTrace();
                         }
-                    }
+
+                    } catch (Exception e) { /* ... */ }
                 }
+
                 else if (commandType.equals("GET")) {
-                    if (parts.length < 2) {
-                        output.println("NOT_FOUND (ID girilmeli)");
-                    } else {
-                        try {
-                            int id = Integer.parseInt(parts[1]);
-                            String result = storageService.get(id); 
+                    try {
+                        int id = Integer.parseInt(parts[1]);
+                        String result = null;
 
-                            if (result == null) { 
-                                List<NodeInfo> locations = messageLocations.get(id);
-                                if (locations != null) {
-                                    for (NodeInfo loc : locations) {
-                                        if (loc.getPort() == self.getPort()) continue;
-                                        result = callRetrieveRpcSync(loc, id); 
-                                        if (result != null) break;
-                                    }
-                                }
+                        List<NodeInfo> locations = messageLocations.get(id);
+                        if (locations != null) {
+                            for (NodeInfo loc : locations) {
+                                result = callRetrieveRpcSync(loc, id);
+                                if (result != null) break;
                             }
-                            output.println(result != null ? result : "NOT_FOUND");
-                        } catch (NumberFormatException e) {
-                            output.println("NOT_FOUND (ID sayi olmali)");
                         }
-                    }
+
+                        if (result != null) {
+                            output.println("OK " + result);
+                        } else {
+                            output.println("NOT_FOUND");
+                        }
+                    } catch (Exception e) { /* ... */ }
                 }
-                // chat / broadcast
+                // --- CHAT / BROADCAST ---
                 else {
                     ChatMessage msg = ChatMessage.newBuilder()
                             .setText(text)
@@ -204,6 +182,7 @@ public class NodeMain {
         }
     }
 
+
     private static void broadcastToFamily(NodeRegistry registry,
                                           NodeInfo self,
                                           ChatMessage msg) {
@@ -211,6 +190,7 @@ public class NodeMain {
         List<NodeInfo> members = registry.snapshot();
 
         for (NodeInfo n : members) {
+            // Kendimize tekrar gönderme
             if (n.getHost().equals(self.getHost()) && n.getPort() == self.getPort()) {
                 continue;
             }
@@ -237,6 +217,7 @@ public class NodeMain {
             }
         }
     }
+
 
     private static int findFreePort(int startPort) {
         int port = startPort;
@@ -293,7 +274,7 @@ public class NodeMain {
                 int currentMsgCount;
 
                 if (isMe) {
-                    currentMsgCount = storageService.getCount(); 
+                    currentMsgCount = storageService.getCount();
                 } else {
 
                     currentMsgCount = callGetCountRpc(n);
@@ -305,7 +286,6 @@ public class NodeMain {
                         n.getPort(),
                         isMe ? " (me)" : "",
                         currentMsgCount);
-
 
             }
             System.out.println("======================================");
@@ -346,72 +326,7 @@ public class NodeMain {
                 }
             }
 
-        }, 5, 10, TimeUnit.SECONDS); 
-    }
-
-    private static void callStoreRpc(NodeInfo self, int id, String value, PrintWriter output) {
-        ManagedChannel channel = null;
-        try {
-            channel = ManagedChannelBuilder
-                    .forAddress(self.getHost(), self.getPort())
-                    .usePlaintext()
-                    .build();
-
-            FamilyServiceGrpc.FamilyServiceBlockingStub stub =
-                    FamilyServiceGrpc.newBlockingStub(channel);
-
-            family.StoredMessage msg = family.StoredMessage.newBuilder()
-                    .setId(id)
-                    .setText(value)
-                    .build();
-
-            family.StoreResult result = stub.store(msg);
-
-            if (result.getSuccess()) {
-                output.println("OK");
-            } else {
-                output.println("NOT_FOUND (Store failed)");
-            }
-            System.out.printf("✅ STORE RPC CALLED for ID %d, Success: %s%n", id, result.getSuccess());
-
-        } catch (Exception e) {
-            output.println("NOT_FOUND (RPC Error)");
-            System.err.println("STORE RPC Failed: " + e.getMessage());
-        } finally {
-            if (channel != null) channel.shutdownNow();
-        }
-    }
-
-    private static void callRetrieveRpc(NodeInfo self, int id, PrintWriter output) {
-        ManagedChannel channel = null;
-        try {
-            channel = ManagedChannelBuilder
-                    .forAddress(self.getHost(), self.getPort())
-                    .usePlaintext()
-                    .build();
-
-            FamilyServiceGrpc.FamilyServiceBlockingStub stub =
-                    FamilyServiceGrpc.newBlockingStub(channel);
-
-            family.MessageId msgId = family.MessageId.newBuilder().setId(id).build();
-
-            // RPC çağrısı
-            family.StoredMessage retrievedMsg = stub.retrieve(msgId);
-
-            // Client'a TCP cevabı döndürme
-            if (retrievedMsg.getFound()) {
-                output.println("OK " + retrievedMsg.getText());
-            } else {
-                output.println("NOT_FOUND");
-            }
-            System.out.printf("🔍 RETRIEVE RPC CALLED for ID %d, Found: %s%n", id, retrievedMsg.getFound());
-
-        } catch (Exception e) {
-            output.println("NOT_FOUND (RPC Error)");
-            System.err.println("RETRIEVE RPC Failed: " + e.getMessage());
-        } finally {
-            if (channel != null) channel.shutdownNow();
-        }
+        }, 5, 10, TimeUnit.SECONDS);
     }
 
     private static int loadTolerance() {
@@ -450,7 +365,7 @@ public class NodeMain {
             family.CountResponse res = stub.getCount(family.Empty.newBuilder().build());
             return res.getCount();
         } catch (Exception e) {
-            return -1; 
+            return -1; // Hata durumunda
         } finally {
             channel.shutdownNow();
         }
